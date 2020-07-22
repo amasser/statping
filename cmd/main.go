@@ -1,120 +1,165 @@
-// Statping
-// Copyright (C) 2018.  Hunter Long and the project contributors
-// Written by Hunter Long <info@socialeck.com> and the project contributors
-//
-// https://github.com/hunterlong/statping
-//
-// The licenses for most software and other practical works are designed
-// to take away your freedom to share and change the works.  By contrast,
-// the GNU General Public License is intended to guarantee your freedom to
-// share and change all versions of a program--to make sure it remains free
-// software for all its users.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
 package main
 
 import (
-	"flag"
 	"fmt"
-	"github.com/hunterlong/statping/core"
-	"github.com/hunterlong/statping/handlers"
-	"github.com/hunterlong/statping/plugin"
-	"github.com/hunterlong/statping/source"
-	"github.com/hunterlong/statping/utils"
-	"github.com/joho/godotenv"
+	"github.com/pkg/errors"
+	"github.com/statping/statping/database"
+	"github.com/statping/statping/handlers"
+	"github.com/statping/statping/notifiers"
+	"github.com/statping/statping/source"
+	"github.com/statping/statping/types/configs"
+	"github.com/statping/statping/types/core"
+	"github.com/statping/statping/types/metrics"
+	"github.com/statping/statping/types/services"
+	"github.com/statping/statping/utils"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 var (
 	// VERSION stores the current version of Statping
 	VERSION string
 	// COMMIT stores the git commit hash for this version of Statping
-	COMMIT      string
-	ipAddress   string
-	UsingDotEnv bool
-	port        int
+	COMMIT  string
+	log     = utils.Log.WithField("type", "cmd")
+	confgs  *configs.DbConfig
+	stopped chan bool
 )
 
 func init() {
-	core.VERSION = VERSION
+	stopped = make(chan bool, 1)
+	core.New(VERSION)
+	utils.InitEnvs()
+
+	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(updateCmd)
+	rootCmd.AddCommand(assetsCmd)
+	rootCmd.AddCommand(exportCmd)
+	rootCmd.AddCommand(importCmd)
+	rootCmd.AddCommand(sassCmd)
+	rootCmd.AddCommand(onceCmd)
+	rootCmd.AddCommand(envCmd)
+	rootCmd.AddCommand(resetCmd)
+
+	parseFlags(rootCmd)
 }
 
-// parseFlags will parse the application flags
-// -ip = 0.0.0.0 IP address for outgoing HTTP server
-// -port = 8080 Port number for outgoing HTTP server
-func parseFlags() {
-	ip := flag.String("ip", "0.0.0.0", "IP address to run the Statping HTTP server")
-	p := flag.Int("port", 8080, "Port to run the HTTP server")
-	flag.Parse()
-	ipAddress = *ip
-	port = *p
-	if os.Getenv("PORT") != "" {
-		port = int(utils.ToInt(os.Getenv("PORT")))
-	}
-	if os.Getenv("IP") != "" {
-		ipAddress = os.Getenv("IP")
-	}
+// exit will return an error and return an exit code 1 due to this error
+func exit(err error) {
+	utils.SentryErr(err)
+	log.Fatalln(err)
+	os.Exit(1)
+}
+
+// Close will gracefully stop the database connection, and log file
+func Close() {
+	utils.CloseLogs()
+	confgs.Close()
+	fmt.Println("Shutting down Statping")
 }
 
 // main will run the Statping application
 func main() {
-	var err error
-	parseFlags()
-	loadDotEnvs()
-	source.Assets()
-	if err := utils.InitLogs(); err != nil {
-		fmt.Printf("Statping Log Error: \n %v\n", err)
-		os.Exit(2)
-	}
-	args := flag.Args()
-
-	if len(args) >= 1 {
-		err := catchCLI(args)
-		if err != nil {
-			if err.Error() == "end" {
-				os.Exit(0)
-			}
-			fmt.Println(err)
-			os.Exit(1)
-		}
-	}
-	utils.Log(1, fmt.Sprintf("Starting Statping v%v", VERSION))
-
-	core.Configs, err = core.LoadConfigFile(utils.Directory)
-	if err != nil {
-		utils.Log(3, err)
-		core.SetupMode = true
-		utils.Log(1, handlers.RunHTTPServer(ipAddress, port))
-		os.Exit(1)
-	}
-	mainProcess()
+	go Execute()
+	<-stopped
+	Close()
 }
 
-// loadDotEnvs attempts to load database configs from a '.env' file in root directory
-func loadDotEnvs() error {
-	err := godotenv.Load()
-	if err == nil {
-		utils.Log(1, "Environment file '.env' Loaded")
-		UsingDotEnv = true
+// main will run the Statping application
+func start() {
+	go sigterm()
+	var err error
+	if err := source.Assets(); err != nil {
+		exit(err)
 	}
-	return err
+
+	utils.VerboseMode = verboseMode
+
+	if err := utils.InitLogs(); err != nil {
+		log.Errorf("Statping Log Error: %v\n", err)
+	}
+
+	log.Info(fmt.Sprintf("Starting Statping v%s", VERSION))
+
+	utils.Params.Set("SERVER_IP", ipAddress)
+	utils.Params.Set("SERVER_PORT", port)
+
+	confgs, err = configs.LoadConfigs(configFile)
+	if err != nil {
+		log.Infoln("Starting in Setup Mode")
+		if err = handlers.RunHTTPServer(); err != nil {
+			exit(err)
+		}
+	}
+
+	if err = configs.ConnectConfigs(confgs, true); err != nil {
+		exit(err)
+	}
+
+	if err = confgs.ResetCore(); err != nil {
+		exit(err)
+	}
+
+	if err = confgs.DatabaseChanges(); err != nil {
+		exit(err)
+	}
+
+	if err := confgs.MigrateDatabase(); err != nil {
+		exit(err)
+	}
+
+	if err := mainProcess(); err != nil {
+		exit(err)
+	}
+}
+
+// sigterm will attempt to close the database connections gracefully
+func sigterm() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	<-sigs
+	stopped <- true
 }
 
 // mainProcess will initialize the Statping application and run the HTTP server
-func mainProcess() {
-	dir := utils.Directory
-	var err error
-	err = core.Configs.Connect(false, dir)
-	if err != nil {
-		utils.Log(4, fmt.Sprintf("could not connect to database: %v", err))
+func mainProcess() error {
+	if err := InitApp(); err != nil {
+		return err
 	}
-	core.Configs.MigrateDatabase()
-	core.InitApp()
-	if !core.SetupMode {
-		plugin.LoadPlugins()
-		fmt.Println(handlers.RunHTTPServer(ipAddress, port))
-		os.Exit(1)
+
+	services.LoadServicesYaml()
+
+	if err := handlers.RunHTTPServer(); err != nil {
+		log.Fatalln(err)
+		return errors.Wrap(err, "http server")
 	}
+	return nil
+}
+
+// InitApp will start the Statping instance with a valid database connection
+// This function will gather all services in database, add/init Notifiers,
+// and start the database cleanup routine
+func InitApp() error {
+	// fetch Core row information about this instance.
+	if _, err := core.Select(); err != nil {
+		return err
+	}
+	// init prometheus metrics
+	metrics.InitMetrics()
+	// select all services in database and store services in a mapping of Service pointers
+	if _, err := services.SelectAllServices(true); err != nil {
+		return err
+	}
+	// start routines for each service checking process
+	services.CheckServices()
+	// connect each notifier, added them into database if needed
+	notifiers.InitNotifiers()
+	// start routine to delete old records (failures, hits)
+	go database.Maintenance()
+	// init Sentry error monitoring (its useful)
+	utils.SentryInit(&VERSION, core.App.AllowReports.Bool)
+	core.App.Setup = true
+	core.App.Started = utils.Now()
+	return nil
 }
